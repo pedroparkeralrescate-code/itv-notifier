@@ -3,6 +3,7 @@ name: Comprobar ITV cada 10min
 on:
   schedule:
     - cron: '*/10 * * * *'
+  workflow_dispatch:        # Permite ejecución manual desde la interfaz
 
 jobs:
   check-and-notify:
