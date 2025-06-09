@@ -1,4 +1,4 @@
-name: Comprobar ITV cada 5min
+name: Comprobar ITV cada 10min
 
 on:
   schedule:
