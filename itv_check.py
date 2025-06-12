@@ -24,7 +24,9 @@ def format_dates(appointments):
         key = date.strftime("%Y-%m-%d")
         dates_by_day[key].append(date.strftime("%H:%M"))
     
-    output = [f"CITAS ITV ({result.get('startTime','?')}-{result.get('endTime','?')})", "─"*40]
+    separator = "─" * 15  # <-- reducido de 40 a 15
+
+    output = [f"CITAS ITV ({result.get('startTime','?')}-{result.get('endTime','?')})", separator]
     dias = {
         'Monday': 'LUN','Tuesday': 'MAR','Wednesday': 'MIE',
         'Thursday': 'JUE','Friday': 'VIE','Saturday': 'SAB','Sunday': 'DOM'
@@ -36,12 +38,11 @@ def format_dates(appointments):
         output.append("  " + " │ ".join(sorted(dates_by_day[day])))
         output.append("")
     output += [
-        "─"*40,
+        separator,
         f"Total: {sum(len(v) for v in dates_by_day.values())} citas",
         "Centros: " + os.getenv("CENTERS", "35,36")
     ]
     return "\n".join(output)
-
 # ————————————
 # Lógica de consulta
 # ————————————
@@ -109,12 +110,19 @@ def main():
     parts      = []
     send_message = False
 
+    # Mapeo para mostrar nombre en lugar de número
+    center_names = {
+        "35": "Mahón",
+        "36": "Ciudadela"
+    }
+
     for c in centers:
         data = get_itv_appointments(plate, int(c))
-        # Verificar si hay citas disponibles (no es 512)
         if data.get("result", {}).get("availableDates", {}):
             txt = format_dates(data)
-            parts.append(f"*Centro {c}*\n{txt}")
+            # Usamos el nombre si está, si no, el número
+            display_name = center_names.get(c, f"Centro {c}")
+            parts.append(f"*{display_name}*\n{txt}")
             send_message = True
 
     if send_message:
