@@ -1,136 +1,402 @@
-import os
-import requests
+#!/usr/bin/env python3
+"""Comprueba las citas ITV disponibles y avisa por Telegram.
+
+Solo notifica las citas NUEVAS: las que no se han notificado antes, o que
+dejaron de estar disponibles y han vuelto a aparecer. Las citas ya
+notificadas que siguen disponibles no se repiten.
+
+El estado de lo ya notificado se guarda en STATE_FILE (por defecto
+``state.json``). En GitHub Actions el workflow lo re-ingresa al repositorio
+tras cada ejecución para que persista entre ejecuciones.
+"""
+
+import html
 import json
+import os
 import re
-from datetime import datetime
+import sys
+import time
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
-# ————————————
-# Formateo de citas
-# ————————————
-def format_dates(appointments):
-    if appointments.get("error"):
-        return appointments["error"]
-    
-    result = appointments.get("result", {})
-    available_dates = result.get("availableDates", {})
-    if not available_dates:
-        return "No hay citas disponibles"
-    
-    dates_by_day = defaultdict(list)
-    for _, date_str in available_dates.items():
-        date = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-        date = date.replace(hour=date.hour + 2)
-        key = date.strftime("%Y-%m-%d")
-        dates_by_day[key].append(date.strftime("%H:%M"))
-    
-    separator = "─" * 15  # <-- reducido de 40 a 15
+import requests
 
-    output = [f"CITAS ITV ({result.get('startTime','?')}-{result.get('endTime','?')})", separator]
-    dias = {
-        'Monday': 'LUN','Tuesday': 'MAR','Wednesday': 'MIE',
-        'Thursday': 'JUE','Friday': 'VIE','Saturday': 'SAB','Sunday': 'DOM'
-    }
-    for day in sorted(dates_by_day):
-        dobj = datetime.strptime(day, "%Y-%m-%d")
-        label = dias[dobj.strftime("%A")]
-        output.append(f"{label} {dobj.strftime('%d/%m')}:")
-        output.append("  " + " │ ".join(sorted(dates_by_day[day])))
-        output.append("")
-    output += [
-        separator,
-        f"Total: {sum(len(v) for v in dates_by_day.values())} citas",
-        "Centros: " + os.getenv("CENTERS", "35,36")
-    ]
-    return "\n".join(output)
-# ————————————
-# Lógica de consulta
-# ————————————
-def get_csrf_token(session):
-    r = session.get("https://www.itv-tuvrheinland.es/cita-previa-itv")
-    r.raise_for_status()
-    m = re.search(r'name="csrf-token"\s+content="([^"]+)"', r.text)
-    return m.group(1) if m else None
+BASE_URL = "https://www.itv-tuvrheinland.es"
+MADRID = ZoneInfo("Europe/Madrid")
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+BOOKING_URL = f"{BASE_URL}/cita-previa-itv"
 
-def get_itv_appointments(plate, center_id):
-    base = "https://www.itv-tuvrheinland.es"
-    s = requests.Session()
+STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
+
+# Límite de Telegram: 4096 caracteres por mensaje. Dejamos margen por si
+# el cliente cuenta entidades de distinta forma.
+MESSAGE_SAFE_LEN = 3600
+
+DIAS = {
+    "Monday": "Lunes",
+    "Tuesday": "Martes",
+    "Wednesday": "Miércoles",
+    "Thursday": "Jueves",
+    "Friday": "Viernes",
+    "Saturday": "Sábado",
+    "Sunday": "Domingo",
+}
+
+MESES = {
+    1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
+    5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
+    9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre",
+}
+
+# Catálogo de centros de la web de ITV (clave = tuv_id, que es lo que
+# espera la API como center_id). Menorca: 35 = Maó, 36 = Ciutadella.
+CENTROS = {
+    10: "ITV Terrassa - Viladecavalls",
+    17: "ITV Barcelona Àvila",
+    18: "ITV Barcelona Còrsega",
+    19: "ITV Barcelona La Maquinista - Caracas",
+    20: "ITV Sant Cugat",
+    21: "ITV CIM Vallès",
+    22: "ITV Manresa",
+    23: "ITV Berga",
+    24: "ITV La Seu d'Urgell - Montferrer",
+    25: "ITV Solsona",
+    35: "ITV Menorca Maó",
+    36: "ITV Menorca Ciutadella",
+    38: "ITV Pamplona",
+    39: "ITV Arbizu",
+    40: "ITV Doneztebe",
+    41: "ITV Areta Huarte",
+    42: "ITV en Leganés",
+    43: "ITV Parla",
+    44: "ITV Navas del Rey",
+    45: "ITV Alcorcón",
+    46: "ITV Navalcarnero",
+    47: "ITV en Fuenlabrada",
+    48: "ITV Móstoles",
+    49: "ITV en Rivas H2O",
+    50: "ITV en San Sebastián de los Reyes",
+    51: "ITV Julián Camarillo",
+    52: "ITV Manzanares",
+    53: "ITV Hellín",
+    54: "ITV Almansa",
+    55: "ITV Motilla",
+    56: "ITV Alcolea del Pinar",
+    57: "ITV en Toledo",
+    58: "ITV Lorca",
+    59: "ITV Cartagena",
+    60: "ITV Caravaca",
+    61: "ITV San Pedro del Pinatar",
+    62: "ITV Media Sala (Nueva Cartagena)",
+    63: "ITV Águilas",
+    70: "ITV La Cayetana",
+}
+
+
+class ItvError(Exception):
+    """Error devuelto por la web de la ITV."""
+
+
+# ————————————————————————————————————————
+# Consulta a la web de la ITV
+# ————————————————————————————————————————
+def _post_json(session, path, params, headers):
+    """POST a la API de la ITV validando errores HTTP y de la propia API."""
+    resp = session.post(
+        f"{BASE_URL}/citation/{path}", params=params, headers=headers, timeout=30
+    )
+    resp.raise_for_status()
     try:
-        token = get_csrf_token(s)
-        if not token:
-            return {"error": "Could not obtain CSRF token"}
-        hdr = {
-            "Accept": "application/json, text/plain, */*",
-            "Content-Language": "es",
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/json",
-            "User-Agent": os.getenv("USER_AGENT", "Mozilla/5.0"),
-            "X-CSRF-TOKEN": token,
-            "Referer": f"{base}/cita-previa-itv"
-        }
-        s.post(f"{base}/citation/sendPlate", params={"plate": plate}, headers=hdr).raise_for_status()
-        s.post(f"{base}/citation/getAllCitationServices", params={"vehicle_type_id": 10}, headers=hdr).raise_for_status()
-        s.post(f"{base}/citation/validateFuelAndType", params={"typeId": 10, "fuelId": 1, "service_id": 1}, headers=hdr).raise_for_status()
-        s.post(f"{base}/citation/getRegionsByService", params={"vehicle_type_id": 10, "service_id": 1}, headers=hdr).raise_for_status()
-        resp = s.post(
-            f"{base}/citation/getAvailableDates",
-            params={"center_id": center_id, "vehicle_type_id": 10, "service_id": 1, "is_booking_update": 0},
-            headers=hdr
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        return {"error": f"Request failed: {e}"}
-    except json.JSONDecodeError as e:
-        return {"error": f"JSON parse error: {e}"}
-    except Exception as e:
-        return {"error": f"Unexpected error: {e}"}
+        data = resp.json()
+    except ValueError:
+        raise ItvError(f"Respuesta no válida del endpoint {path}") from None
+    # La API devuelve errores con HTTP 200 (p. ej. "Matrícula no válida"),
+    # así que hay que inspeccionar el cuerpo de la respuesta.
+    if isinstance(data, dict) and data.get("error") is True:
+        raise ItvError(data.get("message") or f"Error desconocido en {path}")
+    return data
 
-# ————————————
+
+def _parse_slot(raw):
+    """Convierte la fecha cruda de la API (UTC) a hora de Madrid."""
+    return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(MADRID)
+
+
+def _slot_id(raw):
+    """Identificador estable de la cita (instante UTC normalizado)."""
+    return datetime.fromisoformat(raw.replace("Z", "+00:00")).isoformat()
+
+
+def fetch_available_dates(plate, center_id):
+    """Devuelve ``{id_cita: datetime}`` con las citas del centro (semana actual)."""
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    page = session.get(f"{BASE_URL}/cita-previa-itv", timeout=30)
+    page.raise_for_status()
+    match = re.search(r'name="csrf-token"\s+content="([^"]+)"', page.text)
+    if not match:
+        raise ItvError("No se pudo obtener el token CSRF de la web")
+
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Language": "es",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/json",
+        "X-CSRF-TOKEN": match.group(1),
+        "Referer": BOOKING_URL,
+    }
+
+    _post_json(session, "sendPlate", {"plate": plate}, headers)
+    _post_json(session, "getAllCitationServices", {"vehicle_type_id": 10}, headers)
+    _post_json(
+        session, "validateFuelAndType",
+        {"typeId": 10, "fuelId": 1, "service_id": 1}, headers,
+    )
+    _post_json(
+        session, "getRegionsByService",
+        {"vehicle_type_id": 10, "service_id": 1}, headers,
+    )
+    data = _post_json(
+        session, "getAvailableDates",
+        {
+            "center_id": center_id,
+            "vehicle_type_id": 10,
+            "service_id": 1,
+            "is_booking_update": 0,
+        },
+        headers,
+    )
+
+    result = data.get("result") or {}
+    slots = {}
+    for raw in (result.get("availableDates") or {}).values():
+        slots[_slot_id(raw)] = _parse_slot(raw)
+    return slots
+
+
+def fetch_with_retry(plate, center_id, attempts=2, wait_seconds=2):
+    """Reintenta la consulta: la web a veces caduca la sesión (HTTP 419)."""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return fetch_available_dates(plate, center_id)
+        except (ItvError, requests.RequestException) as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(wait_seconds)
+    raise last_error
+
+
+# ————————————————————————————————————————
+# Estado de citas ya notificadas
+# ————————————————————————————————————————
+def load_state():
+    """Carga las citas ya notificadas: ``{centro: set(ids)}``."""
+    if STATE_FILE.exists():
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return {"notified": {k: set(v) for k, v in (data.get("notified") or {}).items()}}
+        except (ValueError, OSError):
+            print(
+                f"Aviso: {STATE_FILE} estaba corrupto; se reinicia el seguimiento.",
+                file=sys.stderr,
+            )
+    return {"notified": {}}
+
+
+def save_state(state):
+    """Guarda el estado de forma atómica (tmp + rename)."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"notified": {k: sorted(v) for k, v in state["notified"].items()}}
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+# ————————————————————————————————————————
+# Formato del mensaje de Telegram (HTML)
+# ————————————————————————————————————————
+def _center_groups(center_id, datetimes):
+    """Grupos de líneas de un centro: cabecera, un grupo por día y recuento.
+
+    Devolver grupos independientes permite trocear el mensaje por días si
+    un centro tuviera demasiadas citas para un solo mensaje de Telegram.
+    """
+    name = CENTROS.get(int(center_id), f"Centro {center_id}")
+    groups = [[f"📍 <b>{html.escape(name)}</b>", "─" * 20, ""]]
+
+    by_day = defaultdict(list)
+    for dt in datetimes:
+        by_day[dt.date()].append(dt)
+
+    for day in sorted(by_day):
+        moments = sorted(by_day[day])
+        first = moments[0]
+        lines = [
+            f"🗓 <b>{DIAS[first.strftime('%A')]}, {first.day} de {MESES[first.month]}</b>"
+        ]
+        times = [dt.strftime("%H:%M") for dt in moments]
+        for i in range(0, len(times), 4):
+            lines.append(" · ".join(f"<code>{t}</code>" for t in times[i : i + 4]))
+        lines.append("")
+        groups.append(lines)
+
+    count = len(datetimes)
+    plural = "s" if count != 1 else ""
+    groups.append([f"➕ <i>{count} cita{plural} nueva{plural}</i>", ""])
+    return groups
+
+
+def _lines_len(lines):
+    return sum(len(line) + 1 for line in lines)
+
+
+def _pack(groups, first_title, cont_title, footer):
+    """Empaqueta grupos de líneas en mensajes que no superen el límite."""
+    chunks = []
+    current = [first_title, ""]
+    current_len = _lines_len(current)
+
+    def flush():
+        nonlocal current, current_len
+        if len(current) > 2:
+            chunks.append("\n".join(current))
+        current = [cont_title, ""]
+        current_len = _lines_len(current)
+
+    def add_group(group):
+        nonlocal current_len
+        group_len = _lines_len(group)
+        if group_len <= MESSAGE_SAFE_LEN:
+            if current_len + group_len > MESSAGE_SAFE_LEN and len(current) > 2:
+                flush()
+            current.extend(group)
+            current_len += group_len
+        else:
+            # Grupo anormalmente grande: trocear por líneas individuales.
+            for line in group:
+                if current_len + len(line) + 1 > MESSAGE_SAFE_LEN and len(current) > 2:
+                    flush()
+                current.append(line)
+                current_len += len(line) + 1
+
+    for group in groups:
+        add_group(group)
+    add_group(footer)
+    if len(current) > 2:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def build_message(new_by_center):
+    """Construye el mensaje (o mensajes, si hay que trocearlos) en HTML."""
+    total = sum(len(v) for v in new_by_center.values())
+    plural = "s" if total != 1 else ""
+    footer = [
+        "─" * 20,
+        f"ℹ️ Total: {total} cita{plural} nueva{plural}",
+        f'🔗 <a href="{BOOKING_URL}">Reservar cita</a>',
+    ]
+    groups = []
+    for center_id, datetimes in new_by_center.items():
+        groups.extend(_center_groups(center_id, datetimes))
+    return _pack(
+        groups,
+        "🚗 <b>Nuevas citas ITV</b>",
+        "🚗 <b>Nuevas citas ITV</b> (continuación)",
+        footer,
+    )
+
+
+# ————————————————————————————————————————
 # Envío por Telegram
-# ————————————
+# ————————————————————————————————————————
 def send_via_telegram(text):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text":    text,
-        "parse_mode": "Markdown"
-    }
-    r = requests.post(url, json=payload)
-    r.raise_for_status()
+    if not token or not chat_id:
+        raise RuntimeError("Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
 
-# ————————————
+    resp = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Telegram respondió {resp.status_code}: {resp.text[:200]}")
+
+
+# ————————————————————————————————————————
 # Main
-# ————————————
+# ————————————————————————————————————————
 def main():
-    plate      = os.getenv("PLATE")
-    centers    = os.getenv("CENTERS", "35,36").split(",")
-    parts      = []
-    send_message = False
+    plate = os.getenv("PLATE", "").strip()
+    centers = [c.strip() for c in os.getenv("CENTERS", "35,36").split(",") if c.strip()]
+    if not plate:
+        sys.exit("Error: la variable PLATE no está definida.")
 
-    # Mapeo para mostrar nombre en lugar de número
-    center_names = {
-        "35": "Mahón",
-        "36": "Ciudadela"
-    }
+    state = load_state()
+    notified = state["notified"]
 
-    for c in centers:
-        data = get_itv_appointments(plate, int(c))
-        if data.get("result", {}).get("availableDates", {}):
-            txt = format_dates(data)
-            # Usamos el nombre si está, si no, el número
-            display_name = center_names.get(c, f"Centro {c}")
-            parts.append(f"*{display_name}*\n{txt}")
-            send_message = True
+    # 1) Consultar todos los centros. Ante cualquier error, abortar sin
+    #    tocar el estado para no perder el seguimiento ni avisar mal.
+    current = {}
+    for center in centers:
+        try:
+            current[center] = fetch_with_retry(plate, int(center))
+        except (ItvError, requests.RequestException) as exc:
+            sys.exit(f"Error consultando el centro {center}: {exc}")
 
-    if send_message:
-        message_body = "\n\n".join(parts)
-        send_via_telegram(message_body)
-        print("Mensaje enviado via Telegram.")
+        previous = notified.get(center, set())
+        fresh = set(current[center]) - previous
+        gone = previous - set(current[center])
+        name = CENTROS.get(int(center), f"Centro {center}")
+        print(
+            f"[{name}] disponibles: {len(current[center])} · "
+            f"nuevas: {len(fresh)} · retiradas: {len(gone)}"
+        )
+
+    # 2) Citas nuevas = nunca vistas, o vistas que desaparecieron y han
+    #    vuelto a aparecer (se quitaron del estado al dejar de existir).
+    new_by_center = {}
+    for center in centers:
+        fresh_ids = set(current[center]) - notified.get(center, set())
+        if fresh_ids:
+            new_by_center[center] = sorted(
+                dt for slot_id, dt in current[center].items() if slot_id in fresh_ids
+            )
+
+    # 3) Enviar solo si hay algo nuevo. Si el envío falla, no se guarda el
+    #    estado para reintentarlo en la siguiente ejecución.
+    if new_by_center:
+        total_new = sum(len(v) for v in new_by_center.values())
+        plural = "s" if total_new != 1 else ""
+        try:
+            for chunk in build_message(new_by_center):
+                send_via_telegram(chunk)
+        except RuntimeError as exc:
+            sys.exit(f"Error enviando por Telegram: {exc}")
+        print(f"Mensaje enviado por Telegram ({total_new} cita{plural} nueva{plural}).")
     else:
-        print("No hay citas disponibles, no se envía mensaje.")
+        print("Sin citas nuevas; no se envía mensaje.")
+
+    # 4) Persistir el estado: lo visto pasa a "notificado" y lo que ya no
+    #    está disponible se olvida, para que reaparezca como novedad.
+    for center in centers:
+        notified[center] = set(current[center])
+    save_state({"notified": notified})
+
 
 if __name__ == "__main__":
     main()

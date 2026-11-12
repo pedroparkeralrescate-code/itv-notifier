@@ -3,6 +3,17 @@ name: Comprobar ITV cada 5min
 on:
   workflow_dispatch:        # Permite ejecución manual desde la interfaz
 
+# Evita que dos ejecuciones simultáneas se pisen al guardar el estado.
+concurrency:
+  group: itv-check
+  cancel-in-progress: true
+
+# Permite al workflow re-ingresar state.json al repositorio con el
+# GITHUB_TOKEN, para que el estado de citas ya notificadas persista
+# entre ejecuciones.
+permissions:
+  contents: write
+
 jobs:
   check-and-notify:
     runs-on: ubuntu-latest
@@ -28,3 +39,22 @@ jobs:
 
       - name: Run ITV script
         run: python itv_check.py
+
+      # El script solo escribe state.json cuando la comprobación (y el
+      # envío, si lo hubo) terminan bien; si falla, no hay cambios.
+      - name: Persistir estado de citas notificadas
+        if: always()
+        run: |
+          if [ ! -f state.json ]; then
+            echo "Sin state.json que guardar."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "El estado no ha cambiado; nada que subir."
+          else
+            git commit -m "chore: actualizar estado de citas notificadas"
+            git push
+          fi
