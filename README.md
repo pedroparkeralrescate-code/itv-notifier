@@ -59,11 +59,17 @@ Variables opcionales:
 
 ## Detalles y limitaciones
 
+- **Recupera todas las semanas del calendario abierto** de cada centro, no
+  solo la semana en curso: la web consulta el calendario semana a semana y
+  el script replica esa paginación automáticamente hasta donde llegue el
+  calendario de citas de la ITV.
 - Los horarios se muestran en **hora de Madrid** (`Europe/Madrid`),
   igual que en la web, con conversión correcta de zona horaria (incluido
   el cambio de hora de verano/invierno).
-- La API de la ITV devuelve las citas **por semanas**; el script comprueba
-  la semana en curso (mismo comportamiento que siempre).
 - Ante un error de consulta (web caída, matrícula no válida, sesión
   caducada) el script aborta sin tocar el estado, de modo que la
   siguiente ejecución lo reintente sin perder el seguimiento.
+- Tras añadir el soporte multi-semana, la primera ejecución puede
+  notificar bastantes citas de golpe (todas las disponibles son
+  "nuevas" la primera vez) repartidas en varios mensajes seguidos;
+  a partir de ahí solo llegarán novedades.

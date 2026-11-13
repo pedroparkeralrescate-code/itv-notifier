@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Comprueba las citas ITV disponibles y avisa por Telegram.
 
+Recupera TODAS las citas del calendario abierto de cada centro (todas las
+semanas con disponibilidad, no solo la actual: la API se consulta semana
+a semana igual que hace la web con su calendario).
+
 Solo notifica las citas NUEVAS: las que no se han notificado antes, o que
 dejaron de estar disponibles y han vuelto a aparecer. Las citas ya
 notificadas que siguen disponibles no se repiten.
@@ -32,6 +36,14 @@ USER_AGENT = (
 BOOKING_URL = f"{BASE_URL}/cita-previa-itv"
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
+
+# Servicio 1 = ITV normal (2 = segundas inspecciones).
+SERVICE_ID = 1
+
+# Seguridad: tope de semanas a consultar por centro (~2 años) y pausa
+# entre peticiones para no saturar la web.
+MAX_WEEKS = 104
+WEEK_FETCH_DELAY = 0.3
 
 # Límite de Telegram: 4096 caracteres por mensaje. Dejamos margen por si
 # el cliente cuenta entidades de distinta forma.
@@ -132,8 +144,40 @@ def _slot_id(raw):
     return datetime.fromisoformat(raw.replace("Z", "+00:00")).isoformat()
 
 
+def _parse_slots(result):
+    """Extrae ``{id_cita: datetime}`` de la respuesta de un getAvailableDates."""
+    slots = {}
+    for raw in (result.get("availableDates") or {}).values():
+        slots[_slot_id(raw)] = _parse_slot(raw)
+    return slots
+
+
+def _open_future_weeks(result):
+    """Timestamps de las semanas FUTURAS con disponibilidad (servicio ITV).
+
+    La respuesta inicial incluye ``resultAvailabilityPerWeek`` con todas
+    las semanas abiertas del calendario del centro; es lo que usa la web
+    para habilitar los botones de navegación por semanas. Las respuestas
+    de semanas concretas ya no lo incluyen, así que se toma de aquí.
+    """
+    current_week_ts = result.get("WeekStartDateTimeStamp") or 0
+    return sorted(
+        {
+            week["WeekStartDateTimeStamp"]
+            for week in (result.get("resultAvailabilityPerWeek") or [])
+            if week.get("IdService") == SERVICE_ID
+            and week.get("WeekStartDateTimeStamp", 0) > current_week_ts
+        }
+    )
+
+
 def fetch_available_dates(plate, center_id):
-    """Devuelve ``{id_cita: datetime}`` con las citas del centro (semana actual)."""
+    """Devuelve ``{id_cita: datetime}`` con TODAS las citas del centro.
+
+    Consulta la semana en curso y luego cada semana futura abierta del
+    calendario (el listado de semanas abiertas llega en la primera
+    respuesta, en ``resultAvailabilityPerWeek``).
+    """
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
@@ -156,27 +200,44 @@ def fetch_available_dates(plate, center_id):
     _post_json(session, "getAllCitationServices", {"vehicle_type_id": 10}, headers)
     _post_json(
         session, "validateFuelAndType",
-        {"typeId": 10, "fuelId": 1, "service_id": 1}, headers,
+        {"typeId": 10, "fuelId": 1, "service_id": SERVICE_ID}, headers,
     )
     _post_json(
         session, "getRegionsByService",
-        {"vehicle_type_id": 10, "service_id": 1}, headers,
-    )
-    data = _post_json(
-        session, "getAvailableDates",
-        {
-            "center_id": center_id,
-            "vehicle_type_id": 10,
-            "service_id": 1,
-            "is_booking_update": 0,
-        },
-        headers,
+        {"vehicle_type_id": 10, "service_id": SERVICE_ID}, headers,
     )
 
+    params = {
+        "center_id": center_id,
+        "vehicle_type_id": 10,
+        "service_id": SERVICE_ID,
+        "is_booking_update": 0,
+    }
+
+    # Semana en curso. Esta primera llamada también registra el centro en
+    # la sesión: sin ella, las peticiones de semanas futuras fallan con
+    # "No se ha seleccionado el Centro" (api_error_code 940).
+    data = _post_json(session, "getAvailableDates", params, headers)
     result = data.get("result") or {}
-    slots = {}
-    for raw in (result.get("availableDates") or {}).values():
-        slots[_slot_id(raw)] = _parse_slot(raw)
+    slots = _parse_slots(result)
+
+    # Resto de semanas abiertas del calendario.
+    for position, week_ts in enumerate(_open_future_weeks(result)[:MAX_WEEKS]):
+        week_start = datetime.fromtimestamp(week_ts, MADRID).strftime("%Y-%m-%d")
+        week_data = _post_json(
+            session, "getAvailableDates",
+            {**params, "week_start_date": week_start}, headers,
+        )
+        week_result = week_data.get("result") or {}
+        if week_result.get("WeekStartDateTimeStamp") and week_result[
+            "WeekStartDateTimeStamp"
+        ] != week_ts:
+            # La web devolvió otra semana distinta de la pedida: no mezclar.
+            continue
+        slots.update(_parse_slots(week_result))
+        if position < MAX_WEEKS - 1:
+            time.sleep(WEEK_FETCH_DELAY)
+
     return slots
 
 
@@ -323,18 +384,34 @@ def send_via_telegram(text):
     if not token or not chat_id:
         raise RuntimeError("Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
 
-    resp = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": True},
-        },
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Telegram respondió {resp.status_code}: {resp.text[:200]}")
+    # Con muchas citas nuevas el mensaje se trocea y puede superarse el
+    # límite de envío por chat: se reintenta respetando retry_after.
+    for attempt in range(3):
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "link_preview_options": {"is_disabled": True},
+            },
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            try:
+                retry_after = int(
+                    resp.json().get("parameters", {}).get("retry_after", 2)
+                )
+            except ValueError:
+                retry_after = 2
+            time.sleep(retry_after + 0.5)
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Telegram respondió {resp.status_code}: {resp.text[:200]}"
+            )
+        return
+    raise RuntimeError("Telegram siguió respondiendo 429 tras varios reintentos")
 
 
 # ————————————————————————————————————————
@@ -382,12 +459,18 @@ def main():
     if new_by_center:
         total_new = sum(len(v) for v in new_by_center.values())
         plural = "s" if total_new != 1 else ""
+        chunks = build_message(new_by_center)
         try:
-            for chunk in build_message(new_by_center):
+            for index, chunk in enumerate(chunks):
+                if index:
+                    time.sleep(1.1)  # límite de ~1 mensaje/segundo por chat
                 send_via_telegram(chunk)
         except RuntimeError as exc:
             sys.exit(f"Error enviando por Telegram: {exc}")
-        print(f"Mensaje enviado por Telegram ({total_new} cita{plural} nueva{plural}).")
+        print(
+            f"Mensaje enviado por Telegram ({total_new} cita{plural} nueva{plural}"
+            f" en {len(chunks)} mensaje{'s' if len(chunks) != 1 else ''})."
+        )
     else:
         print("Sin citas nuevas; no se envía mensaje.")
 
